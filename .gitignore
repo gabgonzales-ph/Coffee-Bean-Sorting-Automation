@@ -1,0 +1,6 @@
+venv313/
+__pycache__/
+*.pyc
+error.log
+archive/
+capture/images/
