@@ -38,7 +38,7 @@ lcd.write_string("Booting...")
 
 # ─── Configuration ────────────────────────────────────────────────────────────
 
-MODEL_PATH     = "/home/admin/coffee_bean/models/coffee_bean_model_v2_float32.tflite"
+MODEL_PATH     = "/home/admin/coffee_bean/models/coffee_bean_model_v4_float32.tflite"
 CLASSES        = {0: 'green', 1: 'not_green'}
 CONF_THRESHOLD = 0.5
 NMS_THRESHOLD  = 0.4
@@ -51,6 +51,21 @@ COLOR_GREEN     = (0, 255, 0)
 COLOR_NOT_GREEN = (0, 0, 255)
 
 LCD_INTERVAL = 0.25   # seconds between LCD refreshes (I2C writes are slow)
+
+# ─── Detection zone (centre crop) ────────────────────────────────────────────
+# The model was trained on 320x320 centre crops of the 640x480 frame. This is
+# the same box as CROP_SIZE / CROP_OFFSET in capture.py: keep the two in sync.
+# Only beans inside this box are detected, so the belt must pass through it.
+# With SHOW_PREVIEW=1 the box is drawn on the preview in cyan.
+CROP_W, CROP_H = 320, 320
+CROP_OFFSET    = (0, 0)     # (dx, dy) shift from the exact centre; +x right, +y down
+
+# ─── Reject trigger line ─────────────────────────────────────────────────────
+# A horizontal line across the detection zone. A confirmed reject triggers the
+# kicker only once its box touches this line. 0 = the very top edge of the zone;
+# raise it to move the line down (pixels below the top of the zone).
+# Shown as a white line on the preview (SHOW_PREVIEW=1).
+TRIGGER_LINE_OFFSET = 0
 
 # ─── Batch / Weight Config ───────────────────────────────────────────────────
 TARGET_G         = 2000.0  # trigger weight. Beans still on the belt land after
@@ -70,10 +85,14 @@ try:
     in_det  = interpreter.get_input_details()[0]
     out_det = interpreter.get_output_details()[0]
 
-    img_h = in_det['shape'][1]
-    img_w = in_det['shape'][2]
+    # The input is [1,H,W,3] (channels-last) on older exports and [1,3,H,W]
+    # (channels-first) on newer ones. Read the layout from the model.
+    _s = [int(v) for v in in_det['shape']]
+    channels_first = _s[1] == 3 and _s[3] != 3
+    img_h, img_w = (_s[2], _s[3]) if channels_first else (_s[1], _s[2])
 
-    print(f"Model loaded — input: {img_w}x{img_h}")
+    print(f"Model loaded — input: {img_w}x{img_h} "
+          f"({'channels-first' if channels_first else 'channels-last'})")
 
     lcd.clear()
     lcd.write_string("Init Load Cell")
@@ -187,7 +206,12 @@ class BeanTracker:
                 best_entry, best_dist = entry, dist
         return best_entry
 
-    def update(self, detections: list[dict]) -> list[dict]:
+    @staticmethod
+    def _touches(box, line_y):
+        """True if the bean's box overlaps the horizontal trigger line."""
+        return box[1] <= line_y <= box[3]
+
+    def update(self, detections: list[dict], line_y=None) -> list[dict]:
         for entry in self.pool:
             entry['seen_this_frame'] = False
 
@@ -212,9 +236,18 @@ class BeanTracker:
                             f"(conf={entry['confidence']:.2f}) after "
                             f"{entry['hits']} frames"
                         )
-                        if entry['class_id'] == 1 and not entry['actuator_fired']:
-                            entry['actuator_fired'] = True
-                            trigger_actuator()
+
+                # Reject: remember that it touched the trigger line, and kick
+                # only once it is both confirmed AND has touched the line.
+                if (line_y is not None and entry['class_id'] == 1
+                        and self._touches(entry['box'], line_y)):
+                    if not entry['touched_line']:
+                        print("[LINE] reject touched the trigger line")
+                    entry['touched_line'] = True
+                if (entry['confirmed'] and entry['class_id'] == 1
+                        and entry['touched_line'] and not entry['actuator_fired']):
+                    entry['actuator_fired'] = True
+                    trigger_actuator()
             else:
                 self.pool.append({
                     'box':            det['box'],
@@ -224,6 +257,8 @@ class BeanTracker:
                     'hits':           1,
                     'confirmed':      False,
                     'actuator_fired': False,
+                    'touched_line':   (line_y is not None and det['class_id'] == 1
+                                       and self._touches(det['box'], line_y)),
                     'missed':         0,
                     'seen_this_frame': True,
                 })
@@ -239,12 +274,31 @@ class BeanTracker:
 
 tracker = BeanTracker(confirm_frames=CONFIRM_FRAMES, proximity_px=PROXIMITY_PX)
 
+def get_crop_box(frame_w, frame_h):
+    """Detection zone as (x0, y0, width, height) in full-frame pixels:
+    a CROP_W x CROP_H box in the centre, shifted by CROP_OFFSET, kept inside
+    the frame. Same rule as compute_crop() in capture.py."""
+    cw, ch = min(CROP_W, frame_w), min(CROP_H, frame_h)
+    x0 = (frame_w - cw) // 2 + CROP_OFFSET[0]
+    y0 = (frame_h - ch) // 2 + CROP_OFFSET[1]
+    x0 = max(0, min(x0, frame_w - cw))
+    y0 = max(0, min(y0, frame_h - ch))
+    return x0, y0, cw, ch
+
 def run_inference(frame_bgr):
     orig_h, orig_w = frame_bgr.shape[:2]
 
-    frame_rgb  = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-    resized    = cv2.resize(frame_rgb, (img_w, img_h))
-    input_data = np.expand_dims(resized.astype(np.float32) / 255.0, axis=0)
+    # Only the centre crop goes to the model (same view as the training images).
+    cx0, cy0, cw, ch = get_crop_box(orig_w, orig_h)
+    crop = frame_bgr[cy0:cy0 + ch, cx0:cx0 + cw]
+
+    frame_rgb  = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
+    if (cw, ch) != (img_w, img_h):
+        frame_rgb = cv2.resize(frame_rgb, (img_w, img_h))
+    x = frame_rgb.astype(np.float32) / 255.0
+    if channels_first:
+        x = np.transpose(x, (2, 0, 1))
+    input_data = np.expand_dims(np.ascontiguousarray(x), axis=0)
 
     interpreter.set_tensor(in_det['index'], input_data)
     interpreter.invoke()
@@ -261,11 +315,13 @@ def run_inference(frame_bgr):
         if confidence < CONF_THRESHOLD:
             continue
 
+        # Box values are normalised to the crop; convert to full-frame pixels
+        # (scale by the crop size, then add the crop's position in the frame).
         x_c, y_c, w, h = output[:4, i]
-        x1    = int((x_c - w / 2) * orig_w)
-        y1    = int((y_c - h / 2) * orig_h)
-        box_w = int(w * orig_w)
-        box_h = int(h * orig_h)
+        x1    = int((x_c - w / 2) * cw) + cx0
+        y1    = int((y_c - h / 2) * ch) + cy0
+        box_w = int(w * cw)
+        box_h = int(h * ch)
 
         raw_boxes.append([x1, y1, box_w, box_h])
         raw_scores.append(confidence)
@@ -451,9 +507,12 @@ while not stop_event.is_set():
     if frame_queue.empty():
         frame_queue.put(frame_bgr.copy())
 
+    zx0, zy0, zw, zh = get_crop_box(frame_bgr.shape[1], frame_bgr.shape[0])
+    line_y = zy0 + TRIGGER_LINE_OFFSET
+
     if not detection_queue.empty():
         raw_detections = detection_queue.get_nowait()
-        tracked_beans  = tracker.update(raw_detections)
+        tracked_beans  = tracker.update(raw_detections, line_y)
 
     for bean in tracked_beans:
         x1, y1, x2, y2 = bean['box']
@@ -505,6 +564,10 @@ while not stop_event.is_set():
     )
 
     if SHOW_PREVIEW:
+        # detection zone: only beans inside this cyan box are seen by the model
+        cv2.rectangle(frame_bgr, (zx0, zy0), (zx0 + zw, zy0 + zh), (255, 255, 0), 1)
+        # trigger line: a confirmed reject is kicked once its box touches this
+        cv2.line(frame_bgr, (zx0, line_y), (zx0 + zw, line_y), (255, 255, 255), 2)
         cv2.imshow("Coffee Bean Detection", frame_bgr)
         if cv2.waitKey(1) == ord('q'):
             break
