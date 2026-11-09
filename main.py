@@ -13,7 +13,7 @@ import RPi.GPIO as GPIO
 from ai_edge_litert.interpreter import Interpreter
 from webcam_config import DEVICE_INDEX, RESOLUTION, FRAMERATE, CAMERA_CONTROLS, INITIAL_WAIT, LOCK_WAIT
 from RPLCD.i2c import CharLCD
-from components.buttons import setup_buttons, cleanup_buttons, START_BUTTON_PIN, DEBOUNCE_SEC
+from components.buttons import setup_buttons, cleanup_buttons, START_BUTTON_PIN, STOP_BUTTON_PIN, DEBOUNCE_SEC
 from components.rejector import setup_rejector, kick_reject, cleanup_rejector
 from components.motors import setup_motors, motors_on, motors_off, cleanup_motors
 from components.loadcell import LoadCell, ThresholdDetector, cleanup_loadcell
@@ -42,9 +42,11 @@ MODEL_PATH     = "/home/admin/coffee_bean/models/coffee_bean_model_v4_float32.tf
 CLASSES        = {0: 'green', 1: 'not_green'}
 CONF_THRESHOLD = 0.5
 NMS_THRESHOLD  = 0.4
+NUM_THREADS    = 3
 
-CONFIRM_FRAMES = 4
-PROXIMITY_PX = 40
+CONFIRM_FRAMES = 1
+PROXIMITY_PX   = 80    # max centre distance to match a detection to a track (was 40)
+MAX_MISSED     = 4     # frames a track survives with no match before it is dropped
 
 COLOR_PENDING   = (0, 255, 255)
 COLOR_GREEN     = (0, 255, 0)
@@ -76,10 +78,7 @@ FLAPPER_OPEN_SEC = 15.0    # how long the door stays open to empty the hopper
 SORT_SECONDS     = 20.0    # how long the vibration motor runs (timer-based).
 
 try:
-    lcd.clear()
-    lcd.write_string("Loading Model")
-
-    interpreter = Interpreter(model_path=MODEL_PATH, num_threads=4)
+    interpreter = Interpreter(model_path=MODEL_PATH, num_threads=NUM_THREADS)
     interpreter.allocate_tensors()
 
     in_det  = interpreter.get_input_details()[0]
@@ -92,19 +91,15 @@ try:
     img_h, img_w = (_s[2], _s[3]) if channels_first else (_s[1], _s[2])
 
     print(f"Model loaded — input: {img_w}x{img_h} "
-          f"({'channels-first' if channels_first else 'channels-last'})")
+          f"({'channels-first' if channels_first else 'channels-last'}), "
+          f"threads={NUM_THREADS}")
 
-    lcd.clear()
-    lcd.write_string("Init Load Cell")
     # Uses the tare/scale saved in components/loadcell_cal.json
     loadcell = LoadCell()
     first_reading = loadcell.get_weight_g(samples=3)
     if first_reading is None:
         raise RuntimeError("Load cell (HX711) not responding")
     print(f"Load cell OK — {first_reading:.1f} g")
-
-    lcd.clear()
-    lcd.write_string("Init Camera")
 
     cap = cv2.VideoCapture(DEVICE_INDEX, cv2.CAP_V4L2)
     if not cap.isOpened():
@@ -116,12 +111,13 @@ try:
     cap.set(cv2.CAP_PROP_FRAME_WIDTH,  RESOLUTION[0])
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, RESOLUTION[1])
     cap.set(cv2.CAP_PROP_FPS,          FRAMERATE)
+    # Keep only the newest frame in the driver queue so inference never runs
+    # on an old frame (lower latency between a bean touching the line and the kick).
+    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
     print(f"Webcam opened at {DEVICE_INDEX} — "
           f"requested {RESOLUTION[0]}x{RESOLUTION[1]} @ {FRAMERATE}fps")
 
-    lcd.clear()
-    lcd.write_string("Calibrating...")
     print(f"Settling... waiting {INITIAL_WAIT}s")
     time.sleep(INITIAL_WAIT)
 
@@ -175,8 +171,7 @@ signal.signal(signal.SIGINT, _handle_shutdown_signal)
 def trigger_actuator():
     """Signal the servo kicker arm to reject the bean.
 
-    kick_reject() is a blocking call (~0.55s total, between servo travel
-    time and the hold duration). trigger_actuator() is called from
+    kick_reject() is a blocking call. trigger_actuator() is called from
     BeanTracker.update(), which runs on the main loop thread (frame
     capture + display) — blocking there would stall camera reads and tank
     FPS every time a reject fires. Running it in a short-lived daemon
@@ -187,10 +182,19 @@ def trigger_actuator():
     threading.Thread(target=kick_reject, daemon=True).start()
 
 class BeanTracker:
-    def __init__(self, confirm_frames: int, proximity_px: int):
+    def __init__(self, confirm_frames: int, proximity_px: int, max_missed: int):
         self.confirm_frames = confirm_frames
         self.proximity_px   = proximity_px
+        self.max_missed     = max_missed
         self.pool: list[dict] = []
+        # Cumulative totals for the current batch: incremented once, at the
+        # moment a track becomes confirmed. They do not drop when a track expires.
+        self.counts = {0: 0, 1: 0}
+
+    def reset(self):
+        """Clear tracks and totals. Called when a new batch starts."""
+        self.pool   = []
+        self.counts = {0: 0, 1: 0}
 
     @staticmethod
     def _center(box):
@@ -200,6 +204,8 @@ class BeanTracker:
     def _nearest(self, cx, cy):
         best_entry, best_dist = None, float('inf')
         for entry in self.pool:
+            if entry['seen_this_frame']:
+                continue        # already matched this frame: two beans can't share a track
             ex, ey = self._center(entry['box'])
             dist = ((cx - ex) ** 2 + (cy - ey) ** 2) ** 0.5
             if dist < self.proximity_px and dist < best_dist:
@@ -211,6 +217,32 @@ class BeanTracker:
         """True if the bean's box overlaps the horizontal trigger line."""
         return box[1] <= line_y <= box[3]
 
+    def _evaluate(self, entry, line_y):
+        """Confirm the track, remember line contact, and fire the kicker.
+        Runs for both new and existing tracks, so CONFIRM_FRAMES = 1 confirms
+        on the very first frame instead of waiting for a second sighting."""
+        if not entry['confirmed'] and entry['hits'] >= self.confirm_frames:
+            entry['confirmed'] = True
+            self.counts[entry['class_id']] += 1
+            print(
+                f"[CONFIRMED] {entry['class_name']} "
+                f"(conf={entry['confidence']:.2f}) after "
+                f"{entry['hits']} frames"
+            )
+
+        # Reject: remember that it touched the trigger line, and kick
+        # only once it is both confirmed AND has touched the line.
+        if (line_y is not None and entry['class_id'] == 1
+                and self._touches(entry['box'], line_y)):
+            if not entry['touched_line']:
+                print("[LINE] reject touched the trigger line")
+            entry['touched_line'] = True
+
+        if (entry['confirmed'] and entry['class_id'] == 1
+                and entry['touched_line'] and not entry['actuator_fired']):
+            entry['actuator_fired'] = True
+            trigger_actuator()
+
     def update(self, detections: list[dict], line_y=None) -> list[dict]:
         for entry in self.pool:
             entry['seen_this_frame'] = False
@@ -220,59 +252,53 @@ class BeanTracker:
             entry  = self._nearest(cx, cy)
 
             if entry is not None:
-                entry['box']              = det['box']
-                entry['class_id']         = det['class_id']
-                entry['class_name']       = det['class_name']
-                entry['confidence']       = det['confidence']
-                entry['seen_this_frame']  = True
-                entry['missed']           = 0
+                entry['box']             = det['box']
+                entry['confidence']      = det['confidence']
+                entry['seen_this_frame'] = True
+                entry['missed']          = 0
 
+                # Once confirmed, the class is locked so a flickering score
+                # cannot turn a green bean into a reject (or the reverse).
                 if not entry['confirmed']:
-                    entry['hits'] += 1
-                    if entry['hits'] >= self.confirm_frames:
-                        entry['confirmed'] = True
-                        print(
-                            f"[CONFIRMED] {entry['class_name']} "
-                            f"(conf={entry['confidence']:.2f}) after "
-                            f"{entry['hits']} frames"
-                        )
-
-                # Reject: remember that it touched the trigger line, and kick
-                # only once it is both confirmed AND has touched the line.
-                if (line_y is not None and entry['class_id'] == 1
-                        and self._touches(entry['box'], line_y)):
-                    if not entry['touched_line']:
-                        print("[LINE] reject touched the trigger line")
-                    entry['touched_line'] = True
-                if (entry['confirmed'] and entry['class_id'] == 1
-                        and entry['touched_line'] and not entry['actuator_fired']):
-                    entry['actuator_fired'] = True
-                    trigger_actuator()
+                    entry['class_id']   = det['class_id']
+                    entry['class_name'] = det['class_name']
+                    entry['hits']      += 1
             else:
-                self.pool.append({
-                    'box':            det['box'],
-                    'class_id':       det['class_id'],
-                    'class_name':     det['class_name'],
-                    'confidence':     det['confidence'],
-                    'hits':           1,
-                    'confirmed':      False,
-                    'actuator_fired': False,
-                    'touched_line':   (line_y is not None and det['class_id'] == 1
-                                       and self._touches(det['box'], line_y)),
-                    'missed':         0,
+                if self.pool:
+                    d = min(
+                        ((cx - self._center(e['box'])[0]) ** 2 +
+                         (cy - self._center(e['box'])[1]) ** 2) ** 0.5
+                        for e in self.pool
+                    )
+                    print(f"[TRACK] new track, nearest existing = {d:.0f}px")
+                entry = {
+                    'box':             det['box'],
+                    'class_id':        det['class_id'],
+                    'class_name':      det['class_name'],
+                    'confidence':      det['confidence'],
+                    'hits':            1,
+                    'confirmed':       False,
+                    'actuator_fired':  False,
+                    'touched_line':    False,
+                    'missed':          0,
                     'seen_this_frame': True,
-                })
+                }
+                self.pool.append(entry)
+
+            self._evaluate(entry, line_y)
 
         for entry in self.pool:
             if not entry['seen_this_frame']:
                 entry['missed'] += 1
 
-        self.pool = [e for e in self.pool if e['missed'] <= self.confirm_frames]
+        self.pool = [e for e in self.pool if e['missed'] <= self.max_missed]
 
         return self.pool
 
 
-tracker = BeanTracker(confirm_frames=CONFIRM_FRAMES, proximity_px=PROXIMITY_PX)
+tracker = BeanTracker(confirm_frames=CONFIRM_FRAMES,
+                      proximity_px=PROXIMITY_PX,
+                      max_missed=MAX_MISSED)
 
 def get_crop_box(frame_w, frame_h):
     """Detection zone as (x0, y0, width, height) in full-frame pixels:
@@ -305,46 +331,43 @@ def run_inference(frame_bgr):
 
     output = interpreter.get_tensor(out_det['index'])[0]
 
-    raw_boxes, raw_scores, raw_class_ids = [], [], []
+    # Vectorised decode: no Python loop over the 2100 candidate boxes.
+    scores_all = output[4:, :]                          # [classes, N]
+    class_ids  = np.argmax(scores_all, axis=0)
+    confs      = scores_all[class_ids, np.arange(scores_all.shape[1])]
+    keep_mask  = confs >= CONF_THRESHOLD
+    if not np.any(keep_mask):
+        return []
 
-    for i in range(output.shape[1]):
-        class_probs = output[4:, i]
-        class_id    = int(np.argmax(class_probs))
-        confidence  = float(class_probs[class_id])
+    xc = output[0, keep_mask]
+    yc = output[1, keep_mask]
+    w  = output[2, keep_mask]
+    h  = output[3, keep_mask]
+    confs     = confs[keep_mask]
+    class_ids = class_ids[keep_mask]
 
-        if confidence < CONF_THRESHOLD:
-            continue
+    # Box values are normalised to the crop; convert to full-frame pixels
+    # (scale by the crop size, then add the crop's position in the frame).
+    x1 = ((xc - w / 2) * cw).astype(int) + cx0
+    y1 = ((yc - h / 2) * ch).astype(int) + cy0
+    bw = (w * cw).astype(int)
+    bh = (h * ch).astype(int)
+    boxes = np.stack([x1, y1, bw, bh], axis=1).tolist()
 
-        # Box values are normalised to the crop; convert to full-frame pixels
-        # (scale by the crop size, then add the crop's position in the frame).
-        x_c, y_c, w, h = output[:4, i]
-        x1    = int((x_c - w / 2) * cw) + cx0
-        y1    = int((y_c - h / 2) * ch) + cy0
-        box_w = int(w * cw)
-        box_h = int(h * ch)
-
-        raw_boxes.append([x1, y1, box_w, box_h])
-        raw_scores.append(confidence)
-        raw_class_ids.append(class_id)
-
+    # Class-agnostic NMS: ONE box per bean, even when the model is torn between
+    # green and not_green on it (per-class NMS kept both boxes, which the
+    # tracker then counted as two beans).
+    keep = cv2.dnn.NMSBoxes(boxes, confs.tolist(), CONF_THRESHOLD, NMS_THRESHOLD)
     detections = []
-    for cls_id in set(raw_class_ids):
-        indices    = [i for i, c in enumerate(raw_class_ids) if c == cls_id]
-        cls_boxes  = [raw_boxes[i]  for i in indices]
-        cls_scores = [raw_scores[i] for i in indices]
-
-        keep = cv2.dnn.NMSBoxes(cls_boxes, cls_scores, CONF_THRESHOLD, NMS_THRESHOLD)
-        if len(keep) == 0:
-            continue
-
-        for k in keep.flatten():
-            x, y, bw, bh = cls_boxes[k]
-            detections.append({
-                "class_id":   cls_id,
-                "class_name": CLASSES.get(cls_id, 'unknown'),
-                "confidence": round(cls_scores[k], 4),
-                "box":        [x, y, x + bw, y + bh]
-            })
+    for k in np.array(keep).flatten():
+        cls_id = int(class_ids[k])
+        x, y, bwk, bhk = boxes[k]
+        detections.append({
+            "class_id":   cls_id,
+            "class_name": CLASSES.get(cls_id, 'unknown'),
+            "confidence": round(float(confs[k]), 4),
+            "box":        [x, y, x + bwk, y + bhk]
+        })
 
     detections.sort(key=lambda d: d['confidence'], reverse=True)
     return detections
@@ -356,7 +379,9 @@ def inference_worker():
         except queue.Empty:
             continue
 
+        t0 = time.time()
         detections = run_inference(frame)
+        inf_ms = (time.time() - t0) * 1000
 
         if not detection_queue.empty():
             try:
@@ -366,7 +391,7 @@ def inference_worker():
         detection_queue.put(detections)
 
         if detections:
-            print(f"[DETECTIONS] {len(detections)} raw found")
+            print(f"[DETECTIONS] {len(detections)} raw found (inference {inf_ms:.0f} ms)")
             for det in detections:
                 print(f"  {det['class_name']} {det['confidence']:.2f}")
 
@@ -423,17 +448,58 @@ def start_pressed() -> bool:
         time.sleep(0.02)                            # wait for release
     return True
 
+# ─── Stop / Safe Shutdown button (non-blocking) ─────────────────────────────
+# One button, two jobs depending on the state:
+#   RUNNING / FILLED -> emergency stop: abort the batch, go back to IDLE
+#   IDLE             -> safe shutdown of the Raspberry Pi
+# Python polls GPIO17 itself, so the kernel gpio-shutdown overlay must be
+# removed from /boot/firmware/config.txt (otherwise it powers off instantly).
+# Waits for release so one press is never read as two.
+def stop_pressed() -> bool:
+    if GPIO.input(STOP_BUTTON_PIN) == GPIO.HIGH:
+        return False
+    time.sleep(DEBOUNCE_SEC)
+    if GPIO.input(STOP_BUTTON_PIN) == GPIO.HIGH:    # was contact bounce
+        return False
+    while GPIO.input(STOP_BUTTON_PIN) == GPIO.LOW and not stop_event.is_set():
+        time.sleep(0.02)                            # wait for release
+    return True
+
+# In IDLE the same button must be HELD this long to shut the Pi down, so a
+# stray tap (or a second tap right after an emergency stop) does nothing.
+SHUTDOWN_HOLD_SEC = 2.0
+
+def stop_held(hold_sec: float = SHUTDOWN_HOLD_SEC) -> bool:
+    """True once the Stop button has been held for hold_sec. A shorter press
+    returns False when released. Shows a hint on the LCD while held."""
+    if GPIO.input(STOP_BUTTON_PIN) == GPIO.HIGH:
+        return False
+    time.sleep(DEBOUNCE_SEC)
+    if GPIO.input(STOP_BUTTON_PIN) == GPIO.HIGH:    # was contact bounce
+        return False
+    t0 = time.time()
+    while GPIO.input(STOP_BUTTON_PIN) == GPIO.LOW and not stop_event.is_set():
+        if time.time() - t0 >= hold_sec:
+            return True
+        lcd_row(0, "Keep holding...")
+        lcd_row(1, "to power off")
+        time.sleep(0.02)
+    return False        # released early; the IDLE loop redraws its screen
+
 # ─── State machine ──────────────────────────────────────────────────────────
-#   IDLE ──Start──> RUNNING ──2kg──> FILLED ──> IDLE ("Complete")
+#   IDLE ──Start──> RUNNING ──2kg──> FILLED ──> IDLE ("Process Complete")
+#   RUNNING / FILLED ──Stop button──> IDLE ("Process Stopped")
+#   IDLE ──hold Stop button 2 s──> safe shutdown of the Pi
 #
-#   IDLE     motors off, waiting for Start (LCD: Idle / Complete)
+#   IDLE     motors off, waiting for Start (LCD: Press Start / Process Complete)
 #   RUNNING  motors on, detecting + rejecting, weight monitored
 #   FILLED   motors off, settle, then flapper opens AND vibration starts
 #            together. Flapper closes at FLAPPER_OPEN_SEC, vibration stops
 #            at SORT_SECONDS. LCD shows the vibration countdown.
 # Motors only turn back on when the person presses Start again.
+shutdown_requested = False   # set by the Stop button in IDLE
 state      = "IDLE"
-idle_title = "Idle"
+idle_title = ""      # empty = plain "Press Start" screen
 detector   = ThresholdDetector(target_g=TARGET_G, confirm=TARGET_CONFIRM)
 
 lcd.clear()
@@ -442,14 +508,22 @@ while not stop_event.is_set():
 
     # ── IDLE ────────────────────────────────────────────────────────────────
     if state == "IDLE":
-        lcd_row(0, idle_title)
-        lcd_row(1, "Press Start")
+        if idle_title:                      # after a finished batch
+            lcd_row(0, idle_title)
+            lcd_row(1, "Press Start")
+        else:                               # fresh boot
+            lcd_row(0, "Press Start")
+            lcd_row(1, "")
         if start_pressed() and not stop_event.is_set():
             print("[STATE] Start pressed — beginning batch")
-            tracker.pool  = []
+            tracker.reset()                 # clears tracks and G/R totals
             tracked_beans = []
             try:
                 frame_queue.get_nowait()
+            except queue.Empty:
+                pass
+            try:
+                detection_queue.get_nowait()    # drop a stale detection result
             except queue.Empty:
                 pass
             for _ in range(5):          # drop stale buffered camera frames
@@ -459,6 +533,10 @@ while not stop_event.is_set():
             lcd.clear()
             last_lcd_lines[0] = last_lcd_lines[1] = ""
             state = "RUNNING"
+        elif stop_held():
+            print("[STATE] Stop button held in IDLE — safe shutdown")
+            shutdown_requested = True
+            stop_event.set()
         else:
             time.sleep(0.05)
         continue
@@ -469,7 +547,18 @@ while not stop_event.is_set():
         motors_off()
         lcd_row(0, "Target reached")
         lcd_row(1, "Stopping belt")
-        stop_event.wait(SETTLE_SEC)           # let in-flight beans land
+        aborted = False
+        settle_end = time.time() + SETTLE_SEC   # let in-flight beans land
+        while time.time() < settle_end and not stop_event.is_set():
+            if stop_pressed():
+                aborted = True
+                break
+            time.sleep(0.05)
+        if aborted:
+            print("[STATE] STOP pressed during settle — back to IDLE")
+            idle_title = "Process Stopped"
+            state = "IDLE"
+            continue
         # Flapper and vibration start together. The flapper closes after
         # FLAPPER_OPEN_SEC; the vibration keeps running until SORT_SECONDS.
         print("[STATE] Flapper open + vibration trays running")
@@ -478,6 +567,9 @@ while not stop_event.is_set():
         open_flapper()
         flapper_closed = False
         while not stop_event.is_set():
+            if stop_pressed():
+                aborted = True
+                break
             elapsed = time.time() - dump_start
             if not flapper_closed and elapsed >= FLAPPER_OPEN_SEC:
                 close_flapper()
@@ -493,12 +585,26 @@ while not stop_event.is_set():
         vibration_off()
         if not flapper_closed:      # stop requested, or SORT_SECONDS < open time
             close_flapper()
-        print("[STATE] Process complete — waiting for Start")
-        idle_title = "Complete"
+        if aborted:
+            print("[STATE] STOP pressed during sorting — back to IDLE")
+            idle_title = "Process Stopped"
+        else:
+            print("[STATE] Process complete — waiting for Start")
+            idle_title = "Process Complete"
         state = "IDLE"
         continue
 
     # ── RUNNING ─────────────────────────────────────────────────────────────
+    # Emergency stop: motors off, drop tracked beans, back to IDLE.
+    if stop_pressed():
+        print("[STATE] STOP pressed — aborting batch")
+        motors_off()
+        tracker.pool  = []
+        tracked_beans = []
+        idle_title = "Process Stopped"
+        state = "IDLE"
+        continue
+
     ret, frame_bgr = cap.read()
     if not ret:
         print("[WARN] Frame grab failed — retrying")
@@ -540,9 +646,10 @@ while not stop_event.is_set():
         fps_timer   = time.time()
         print(f"[FPS] {current_fps:.1f}")
 
-    confirmed_green = sum(1 for b in tracked_beans if b['confirmed'] and b['class_id'] == 0)
-    confirmed_reject = sum(1 for b in tracked_beans if b['confirmed'] and b['class_id'] == 1)
-    pending_count   = sum(1 for b in tracked_beans if not b['confirmed'])
+    # Cumulative totals for this batch (one count per confirmed track).
+    confirmed_green  = tracker.counts[0]
+    confirmed_reject = tracker.counts[1]
+    pending_count    = sum(1 for b in tracked_beans if not b['confirmed'])
 
     weight_g = weight_state["g"]
 
@@ -554,7 +661,7 @@ while not stop_event.is_set():
         else:
             shown = 0.0 if abs(weight_g) < 0.05 else weight_g   # avoid "-0.0"
             lcd_row(0, f"Wt:{shown:8.1f} g")
-        lcd_row(1, f"G:{confirmed_green} R:{confirmed_reject} F:{current_fps:.0f}")
+        lcd_row(1, f"G:{confirmed_green} R:{confirmed_reject}")
 
     weight_text = "ERR" if weight_g is None else f"{weight_g:.1f}g"
     cv2.putText(
@@ -589,5 +696,30 @@ cleanup_flapper()
 cleanup_loadcell()
 cleanup_buttons()   # calls GPIO.cleanup(), keep this last
 lcd.clear()
-lcd.write_string("Stopped")
-print("Stopped")
+if shutdown_requested:
+    lcd.write_string("Power Off Device")
+    lcd.cursor_pos = (1, 0)
+    lcd.write_string("Wait for LED off")
+    print("Powering off")
+    # needs passwordless sudo for the service user (default on Raspberry Pi OS).
+    # Each attempt's result goes to the journal; try the next one on failure.
+    poweroff_ok = False
+    for cmd in (["sudo", "-n", "systemctl", "poweroff"],
+                ["sudo", "-n", "systemctl", "poweroff", "-i"],
+                ["sudo", "-n", "/sbin/shutdown", "-h", "now"]):
+        r = subprocess.run(cmd, capture_output=True, text=True)
+        print(f"[POWEROFF] {' '.join(cmd)} -> rc={r.returncode} "
+              f"{(r.stdout + r.stderr).strip()}")
+        if r.returncode == 0:
+            poweroff_ok = True
+            break
+    if not poweroff_ok:
+        # Exit with an error so systemd (Restart=on-failure) restarts the
+        # program and the machine returns to "Press Start".
+        lcd.clear()
+        lcd.write_string("Shutdown failed")
+        time.sleep(3)
+        raise SystemExit(1)
+else:
+    lcd.write_string("Stopped")
+    print("Stopped")

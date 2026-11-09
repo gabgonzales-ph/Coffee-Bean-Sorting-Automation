@@ -21,7 +21,7 @@ FRAMERATE    = 30         # needs MJPG: this camera gives 30 fps in MJPG but onl
 INITIAL_WAIT = 2          # seconds to let the sensor settle after opening
 LOCK_WAIT    = 1          # seconds for locked settings to take effect
 
-# Control names match `v4l2-ctl -d <device> --list-ctrls`.
+# Control names match v4l2-ctl -d <device> --list-ctrls.
 # ORDER MATTERS: main.py applies these top to bottom, so each auto mode is
 # switched to manual BEFORE the absolute value that depends on it.
 CAMERA_CONTROLS = {
