@@ -32,8 +32,24 @@ PWM_FREQ    = 50    # SG90 expects a 50Hz control signal
 # Pulse widths (duty-cycle %) for each servo position.
 # SG90 range is roughly 1ms (0 deg) to 2ms (180 deg) pulse width at 50Hz (20ms period).
 #   duty% = (pulse_ms / 20ms) * 100
+# These are the ORIGINAL (non-inverted) positions. Tune them here.
 REST_ANGLE_DUTY = 2.5    # ~0 deg, resting position, out of the beans' path
 KICK_ANGLE_DUTY = 6.0    # ~63 deg, swung out; lower until it just clears the bean
+
+# Kick in the opposite direction: mirrors both positions around the servo's
+# centre (7.5% = 90 deg). With INVERT_KICK = True the arm RESTS at the other end
+# (12.5% = 180 deg) and swings the same distance the other way (9.0% = 117 deg).
+# The arm's rest position moves to the opposite side, so make sure that side is
+# clear of the belt, and that the arm is not forced against its end stop.
+INVERT_KICK = True
+CENTER_DUTY = 7.5
+
+if INVERT_KICK:
+    _REST_DUTY = 2 * CENTER_DUTY - REST_ANGLE_DUTY
+    _KICK_DUTY = 2 * CENTER_DUTY - KICK_ANGLE_DUTY
+else:
+    _REST_DUTY = REST_ANGLE_DUTY
+    _KICK_DUTY = KICK_ANGLE_DUTY
 
 KICK_HOLD_SEC   = 0.05   # hold at kick position before returning
 KICK_TRAVEL_SEC = 0.12   # time allowed to reach kick position
@@ -56,7 +72,7 @@ def setup_rejector():
     # Force GPIO12 to its PWM function (ALT0) in case something reset it to GPIO
     subprocess.run(["pinctrl", "set", str(SERVO_PIN), "a0"], check=False)
     _pwm = HardwarePWM(pwm_channel=PWM_CHANNEL, hz=PWM_FREQ, chip=PWM_CHIP)
-    _pwm.start(REST_ANGLE_DUTY)
+    _pwm.start(_REST_DUTY)
     time.sleep(MOVE_SETTLE_SEC)
 
 
@@ -74,10 +90,10 @@ def kick_reject():
     with _lock:
         if _pwm is None:      # cleanup ran while this kick was waiting
             return
-        _pwm.change_duty_cycle(KICK_ANGLE_DUTY)
+        _pwm.change_duty_cycle(_KICK_DUTY)
         time.sleep(KICK_TRAVEL_SEC + KICK_HOLD_SEC)
 
-        _pwm.change_duty_cycle(REST_ANGLE_DUTY)
+        _pwm.change_duty_cycle(_REST_DUTY)
         time.sleep(RETURN_SEC)
         # Pulses keep running at the rest duty, so the arm stays held in place.
 
@@ -89,7 +105,7 @@ def cleanup_rejector():
     with _lock:
         if _pwm is not None:
             try:
-                _pwm.change_duty_cycle(REST_ANGLE_DUTY)
+                _pwm.change_duty_cycle(_REST_DUTY)
                 time.sleep(MOVE_SETTLE_SEC)
             finally:
                 _pwm.stop()
