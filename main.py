@@ -75,7 +75,7 @@ TARGET_G         = 2000.0  # trigger weight. Beans still on the belt land after
 TARGET_CONFIRM   = 3       # consecutive readings >= target before triggering
 SETTLE_SEC       = 1.0     # wait after motors stop so in-flight beans land
 FLAPPER_OPEN_SEC = 15.0    # how long the door stays open to empty the hopper
-SORT_SECONDS     = 5.0    # how long the vibration motor runs (timer-based).
+SORT_SECONDS     = 60.0    # how long the vibration motor runs (timer-based).
 
 try:
     interpreter = Interpreter(model_path=MODEL_PATH, num_threads=NUM_THREADS)
