@@ -38,13 +38,13 @@ lcd.write_string("Booting...")
 
 # ─── Configuration ────────────────────────────────────────────────────────────
 
-MODEL_PATH     = "/home/admin/coffee_bean/models/best_v8.tflite"
+MODEL_PATH     = "/home/admin/coffee_bean/models/best_v9.tflite"
 CLASSES        = {0: 'green', 1: 'not_green'}
 CONF_THRESHOLD = 0.5
 NMS_THRESHOLD  = 0.4
 NUM_THREADS    = 3
 
-CONFIRM_FRAMES = 1
+CONFIRM_FRAMES = 4
 PROXIMITY_PX   = 80    # max centre distance to match a detection to a track (was 40)
 MAX_MISSED     = 4     # frames a track survives with no match before it is dropped
 
@@ -75,7 +75,7 @@ TARGET_G         = 2000.0  # trigger weight. Beans still on the belt land after
 TARGET_CONFIRM   = 3       # consecutive readings >= target before triggering
 SETTLE_SEC       = 1.0     # wait after motors stop so in-flight beans land
 FLAPPER_OPEN_SEC = 15.0    # how long the door stays open to empty the hopper
-SORT_SECONDS     = 20.0    # how long the vibration motor runs (timer-based).
+SORT_SECONDS     = 5.0    # how long the vibration motor runs (timer-based).
 
 try:
     interpreter = Interpreter(model_path=MODEL_PATH, num_threads=NUM_THREADS)

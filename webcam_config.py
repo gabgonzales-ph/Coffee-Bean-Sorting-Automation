@@ -34,7 +34,7 @@ CAMERA_CONTROLS = {
     "white_balance_temperature"  : 4600,  # range 2800-6500, any value (camera default 4600).
                                           # Match your light: warm bulb ~3000, daylight/white LED ~5500-6500.
     "gain"                       : 0,     # range 0-100. Lowest noise at 0; raise only if too dark.
-    "brightness"                 : 0,     # range -64 to 64
+    "brightness"                 : 45,     # range -64 to 64
     "contrast"                   : 32,    # range 0-64 (camera default 32)
     "saturation"                 : 32,    # range 1-128 (camera default 64). Keep this near the
                                           # default: green vs non-green depends on colour.
