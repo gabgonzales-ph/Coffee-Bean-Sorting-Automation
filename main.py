@@ -38,7 +38,7 @@ lcd.write_string("Booting...")
 
 # ─── Configuration ────────────────────────────────────────────────────────────
 
-MODEL_PATH     = "/home/admin/coffee_bean/models/best_v9.tflite"
+MODEL_PATH     = "/home/admin/coffee_bean/models/v12.tflite"
 CLASSES        = {0: 'green', 1: 'not_green'}
 CONF_THRESHOLD = 0.5
 NMS_THRESHOLD  = 0.4
@@ -67,7 +67,7 @@ CROP_OFFSET    = (0, 0)     # (dx, dy) shift from the exact centre; +x right, +y
 # kicker only once its box touches this line. 0 = the very top edge of the zone;
 # raise it to move the line down (pixels below the top of the zone).
 # Shown as a white line on the preview (SHOW_PREVIEW=1).
-TRIGGER_LINE_OFFSET = 0
+TRIGGER_LINE_OFFSET = 10
 
 # ─── Batch / Weight Config ───────────────────────────────────────────────────
 TARGET_G         = 2000.0  # trigger weight. Beans still on the belt land after
@@ -76,6 +76,9 @@ TARGET_CONFIRM   = 3       # consecutive readings >= target before triggering
 SETTLE_SEC       = 1.0     # wait after motors stop so in-flight beans land
 FLAPPER_OPEN_SEC = 15.0    # how long the door stays open to empty the hopper
 SORT_SECONDS     = 60.0    # how long the vibration motor runs (timer-based).
+
+# ─── Automatic tare at Start ────────────────────────────────────────────────
+TARE_SETTLE_SEC = 0.7      # wait after the Start press so the hopper is still
 
 try:
     interpreter = Interpreter(model_path=MODEL_PATH, num_threads=NUM_THREADS)
@@ -540,6 +543,23 @@ def reopen_camera():
     print(f"[CAMERA] reopened {dev}, first read {'ok' if ok else 'FAILED'}")
     return ok
 
+def do_start_tare():
+    """Zero the scale before a batch. Motors are still off here.
+    Returns "ok", "not_empty", "unstable" or "error" (see LoadCell.tare_auto)."""
+    lcd_row(0, "Zeroing scale...")
+    lcd_row(1, "Keep still")
+    time.sleep(TARE_SETTLE_SEC)
+    try:
+        status, before = loadcell.tare_auto()
+    except Exception as e:
+        print(f"[TARE] error: {e!r}")
+        status, before = "error", None
+    shown = "n/a" if before is None else f"{before:.1f} g"
+    print(f"[TARE] status={status} reading before tare={shown}")
+    if status == "ok":
+        weight_state["g"] = 0.0
+    return status
+
 shutdown_requested = False   # set by the Stop button in IDLE
 state      = "IDLE"
 idle_title = ""      # empty = plain "Press Start" screen
@@ -559,6 +579,13 @@ while not stop_event.is_set():
             lcd_row(1, "")
         if start_pressed() and not stop_event.is_set():
             print("[STATE] Start pressed — beginning batch")
+            tare_result = do_start_tare()
+            if tare_result != "ok":
+                print(f"[STATE] tare {tare_result} — batch not started")
+                idle_title = {"not_empty": "Hopper not empty",
+                              "unstable":  "Scale unstable"}.get(tare_result,
+                                                                 "Scale error")
+                continue                    # back to IDLE screen, motors stay off
             tracker.reset()                 # clears tracks and G/R totals
             tracked_beans = []
             try:
@@ -624,8 +651,12 @@ while not stop_event.is_set():
             remaining = SORT_SECONDS - elapsed
             if remaining <= 0:
                 break
-            lcd_row(0, "Sorting")
-            lcd_row(1, f"Time left: {int(remaining) + 1}s")
+            lcd_row(0, "SORTING")
+            w = weight_state["g"]
+            if w is None:
+                lcd_row(1, "W: SENSOR ERR")
+            else:
+                lcd_row(1, f"W:{max(w, 0.0):8.1f} g")
             time.sleep(0.2)
         vibration_off()
         if not flapper_closed:      # stop requested, or SORT_SECONDS < open time
@@ -687,7 +718,6 @@ while not stop_event.is_set():
             motors_on()
             cam_paused = False
             last_lcd_lines[0] = last_lcd_lines[1] = ""
-
     if frame_queue.empty():
         frame_queue.put(frame_bgr.copy())
 
@@ -734,12 +764,12 @@ while not stop_event.is_set():
     now = time.time()
     if now - last_lcd_time >= LCD_INTERVAL:
         last_lcd_time = now
+        lcd_row(0, "PROCESSING")
         if weight_g is None:
-            lcd_row(0, "Wt: SENSOR ERR")
+            lcd_row(1, "W:SENSOR ERR")
         else:
             shown = weight_g if weight_g > 0 else 0.0   # negative or zero shows 0.0
-            lcd_row(0, f"Wt:{shown:8.1f} g")
-        lcd_row(1, f"G:{confirmed_green} R:{confirmed_reject}")
+            lcd_row(1, f"W: {shown:.1f} g")
 
     weight_text = "ERR" if weight_g is None else f"{weight_g:.1f}g"
     cv2.putText(

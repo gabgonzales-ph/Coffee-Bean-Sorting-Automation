@@ -34,7 +34,7 @@ PWM_FREQ    = 50    # SG90 expects a 50Hz control signal
 #   duty% = (pulse_ms / 20ms) * 100
 # These are the ORIGINAL (non-inverted) positions. Tune them here.
 REST_ANGLE_DUTY = 2.5    # ~0 deg, resting position, out of the beans' path
-KICK_ANGLE_DUTY = 6.0    # ~63 deg, swung out; lower until it just clears the bean
+KICK_ANGLE_DUTY = 12.0    # ~63 deg, swung out; lower until it just clears the bean
 
 # Kick in the opposite direction: mirrors both positions around the servo's
 # centre (7.5% = 90 deg). With INVERT_KICK = True the arm RESTS at the other end
